@@ -11,6 +11,7 @@ mod entry;
 mod error;
 mod generator;
 mod locker;
+mod recovery_code;
 mod secret;
 mod storage;
 mod strength;
@@ -28,6 +29,9 @@ pub use secret::SecretString;
 pub use storage::{DEFAULT_BACKUPS, read_file, write_atomic, write_with_backups};
 pub use strength::{MIN_MASTER_PASSWORD_CHARS, check_master_password};
 pub use vault_file::{FORMAT_VERSION, FactorKind, MAX_SLOTS, UnlockedVault};
+// Renamed on export: a bare `encode`/`decode` at the crate root would be
+// ambiguous next to the other encoders in this crate.
+pub use recovery_code::{decode as decode_recovery_code, encode as encode_recovery_code};
 
 /// Version of the core library, taken from `Cargo.toml` at compile time.
 pub fn version() -> &'static str {
