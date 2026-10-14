@@ -9,19 +9,21 @@
 
 mod app_state;
 mod clipboard;
+mod window;
 
 use std::sync::{Mutex, MutexGuard};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use locker_core::EntrySummary;
 use locker_device::DeviceKeyStore;
 use tauri::{Emitter, Manager, State};
+use tauri_plugin_dialog::DialogExt;
 use zeroize::Zeroizing;
 
 use app_state::{
     AppState, DraftInput, Generated, IDLE_LIMIT, PassphraseOptionsInput, PasswordOptionsInput,
-    PastPasswordView, Status,
+    PastPasswordView, Status, backup_file_name,
 };
 
 /// The one shared `AppState`. Commands run on different threads, so access
@@ -210,6 +212,91 @@ fn cancel_recovery_rotation(state: Shared) -> Result<(), String> {
     Ok(())
 }
 
+/// Seconds since 1970, for the suggested backup file name.
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
+// The commands below show a native file dialog. The dialog plugin is used
+// from Rust only: the window has no permission for the plugin's own
+// commands (see `capabilities/default.json`), so it can open no dialog and
+// pick no path itself. They are `async` so Tauri runs them off the thread
+// that drives the window, which a blocking dialog would freeze. The
+// `AppState` mutex is never held while a dialog is open, or the auto-lock
+// thread and every other command would wait for the user.
+
+/// Asks where to save a copy of the encrypted vault, then writes it.
+/// Returns the chosen path, or `None` if the user closed the dialog.
+#[tauri::command(async)]
+fn export_backup(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    state: Shared,
+) -> Result<Option<String>, String> {
+    guard(&state)?
+        .ensure_unlocked()
+        .map_err(|e| e.to_string())?;
+    let picked = app
+        .dialog()
+        .file()
+        .set_parent(&window)
+        .add_filter("Password Locker vault", &["pwlk"])
+        .set_file_name(backup_file_name(unix_now()))
+        .blocking_save_file();
+    let Some(picked) = picked else {
+        return Ok(None);
+    };
+    let dest = picked.into_path().map_err(|e| e.to_string())?;
+    guard(&state)?
+        .export_backup_to(&dest)
+        .map_err(|e| e.to_string())?;
+    Ok(Some(dest.display().to_string()))
+}
+
+/// Asks which backup file to restore from and remembers it in Rust. Returns
+/// the path for display, or `None` if the user closed the dialog.
+#[tauri::command(async)]
+fn pick_backup_file(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    state: Shared,
+) -> Result<Option<String>, String> {
+    let picked = app
+        .dialog()
+        .file()
+        .set_parent(&window)
+        .add_filter("Password Locker vault", &["pwlk"])
+        .blocking_pick_file();
+    let Some(picked) = picked else {
+        return Ok(None);
+    };
+    let source = picked.into_path().map_err(|e| e.to_string())?;
+    let shown = source.display().to_string();
+    guard(&state)?
+        .set_restore_source(source)
+        .map_err(|e| e.to_string())?;
+    Ok(Some(shown))
+}
+
+/// Replaces the vault with the picked backup. `password` and `code` belong
+/// to the backup. On success the vault is open.
+#[tauri::command(async)]
+fn restore_backup(state: Shared, password: String, code: String) -> Result<(), String> {
+    let password = Zeroizing::new(password);
+    let code = Zeroizing::new(code);
+    guard(&state)?
+        .restore_backup(&password, &code)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn cancel_restore(state: Shared) -> Result<(), String> {
+    guard(&state)?.cancel_restore();
+    Ok(())
+}
+
 /// Runs for the life of the app: locks the vault after [`IDLE_LIMIT`] without
 /// activity or when Windows locks the session, and tells the window.
 fn spawn_auto_lock(app: tauri::AppHandle) {
@@ -244,7 +331,16 @@ fn dev_data_dir() -> Option<std::path::PathBuf> {
 
 pub fn run() {
     tauri::Builder::default()
+        // Must be the first plugin. Two copies of the app writing the same
+        // vault would lose changes, so a second start only brings the
+        // running window to the front and exits.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            window::focus_main_window(app);
+        }))
+        // Used from Rust only (the file dialogs above); no window permission.
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
+            window::create_main_window(app)?;
             let (vault_path, device) = match dev_data_dir() {
                 Some(dir) => (
                     dir.join("vault.pwlk"),
@@ -289,6 +385,10 @@ pub fn run() {
             begin_recovery_rotation,
             finish_recovery_rotation,
             cancel_recovery_rotation,
+            export_backup,
+            pick_backup_file,
+            restore_backup,
+            cancel_restore,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

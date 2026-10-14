@@ -95,6 +95,14 @@ export const api = {
   finishRecoveryRotation: (typedCode: string) =>
     invoke<void>("finish_recovery_rotation", { typedCode }),
   cancelRecoveryRotation: () => invoke<void>("cancel_recovery_rotation"),
+
+  /** Shows a save dialog; resolves to the chosen path, or null if closed. */
+  exportBackup: () => invoke<string | null>("export_backup"),
+  /** Shows an open dialog; Rust remembers the file. Resolves to its path, or null. */
+  pickBackupFile: () => invoke<string | null>("pick_backup_file"),
+  restoreBackup: (password: string, code: string) =>
+    invoke<void>("restore_backup", { password, code }),
+  cancelRestore: () => invoke<void>("cancel_restore"),
 };
 
 /** Runs `handler` when Rust locks the vault (idle timeout or Windows lock). */
