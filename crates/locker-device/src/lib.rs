@@ -9,7 +9,7 @@
 //! slot.
 //!
 //! This crate is separate from `locker-core` because DPAPI needs `unsafe`
-//! code, which `locker-core` forbids. All of it is in the `dpapi` module.
+//! code, which `locker-core` forbids. All of it is in the `dpapi` and `session` modules.
 
 #![deny(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -23,6 +23,10 @@ use zeroize::Zeroizing;
 // Only this module is allowed to contain `unsafe`.
 #[allow(unsafe_code)]
 mod dpapi;
+#[allow(unsafe_code)]
+mod session;
+
+pub use session::is_session_locked;
 
 /// First bytes of the key file, so that a wrong file is recognised before
 /// DPAPI is even asked to open it.

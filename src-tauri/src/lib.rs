@@ -1,14 +1,274 @@
 // The window may only call the commands registered in `run` below. Each one
-// is a thin wrapper: the real work happens in `locker_core`.
+// is a thin wrapper: the real work happens in `AppState` (see `app_state.rs`),
+// which holds the unlocked vault and decides what may cross to the window.
+//
+// Security rules every command here follows:
+// - errors are returned as the `Display` text of the core errors, which never
+//   contain secrets;
+// - secrets are returned only by the `reveal_*` commands and the generators.
+
+mod app_state;
+mod clipboard;
+
+use std::sync::{Mutex, MutexGuard};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use locker_core::EntrySummary;
+use locker_device::DeviceKeyStore;
+use tauri::{Emitter, Manager, State};
+use zeroize::Zeroizing;
+
+use app_state::{
+    AppState, DraftInput, Generated, IDLE_LIMIT, PassphraseOptionsInput, PasswordOptionsInput,
+    PastPasswordView, Status,
+};
+
+/// The one shared `AppState`. Commands run on different threads, so access
+/// goes through a mutex.
+type Shared<'a> = State<'a, Mutex<AppState>>;
+
+/// How often the auto-lock thread looks at the clock and the Windows session.
+const AUTO_LOCK_POLL: Duration = Duration::from_secs(5);
+
+/// Locks the mutex, turning a poisoned one (a thread panicked while holding
+/// it) into an error message instead of a second panic.
+fn guard<'a>(state: &'a Shared<'_>) -> Result<MutexGuard<'a, AppState>, String> {
+    state
+        .lock()
+        .map_err(|_| "internal error: the app state is unavailable".to_owned())
+}
 
 #[tauri::command]
-fn core_version() -> &'static str {
-    locker_core::version()
+fn status(state: Shared) -> Result<Status, String> {
+    Ok(guard(&state)?.status())
+}
+
+#[tauri::command]
+fn begin_setup(state: Shared, password: String) -> Result<String, String> {
+    let password = Zeroizing::new(password);
+    let code = guard(&state)?
+        .begin_setup(&password)
+        .map_err(|e| e.to_string())?;
+    // The recovery code is the one secret that must reach the window.
+    Ok(code.to_string())
+}
+
+// `async` so that Tauri runs these on its thread pool instead of the thread
+// that drives the window: key derivation takes about half a second. The
+// mutex is held for that time (acceptable for v1: nothing else is useful
+// while the vault is being opened or created).
+#[tauri::command(async)]
+fn finish_setup(state: Shared, typed_code: String) -> Result<(), String> {
+    guard(&state)?
+        .finish_setup(&typed_code)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn cancel_setup(state: Shared) -> Result<(), String> {
+    guard(&state)?.cancel_setup();
+    Ok(())
+}
+
+#[tauri::command(async)]
+fn unlock(state: Shared, password: String) -> Result<(), String> {
+    let password = Zeroizing::new(password);
+    guard(&state)?.unlock(&password).map_err(|e| e.to_string())
+}
+
+#[tauri::command(async)]
+fn unlock_with_recovery(state: Shared, password: String, code: String) -> Result<(), String> {
+    let password = Zeroizing::new(password);
+    let code = Zeroizing::new(code);
+    guard(&state)?
+        .unlock_with_recovery(&password, &code)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn lock(state: Shared) -> Result<(), String> {
+    guard(&state)?.lock();
+    Ok(())
+}
+
+/// Called by the window while the user is active (typing, clicking), so a
+/// long edit is not interrupted by the auto-lock.
+#[tauri::command]
+fn keep_alive(state: Shared) -> Result<(), String> {
+    guard(&state)?.touch();
+    Ok(())
+}
+
+#[tauri::command]
+fn list_entries(state: Shared, query: String) -> Result<Vec<EntrySummary>, String> {
+    guard(&state)?
+        .list_entries(&query)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn add_entry(state: Shared, draft: DraftInput) -> Result<String, String> {
+    let id = guard(&state)?.add_entry(draft).map_err(|e| e.to_string())?;
+    Ok(id.as_str().to_owned())
+}
+
+#[tauri::command]
+fn update_entry(state: Shared, id: String, draft: DraftInput) -> Result<(), String> {
+    guard(&state)?
+        .update_entry(&id, draft)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn delete_entry(state: Shared, id: String) -> Result<(), String> {
+    guard(&state)?.delete_entry(&id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn reveal_password(state: Shared, id: String) -> Result<String, String> {
+    guard(&state)?
+        .reveal_password(&id)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn reveal_notes(state: Shared, id: String) -> Result<String, String> {
+    guard(&state)?.reveal_notes(&id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn reveal_password_history(state: Shared, id: String) -> Result<Vec<PastPasswordView>, String> {
+    guard(&state)?
+        .reveal_password_history(&id)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn copy_password(state: Shared, id: String) -> Result<(), String> {
+    // The lock is released before touching the clipboard.
+    let password = guard(&state)?
+        .password_for_clipboard(&id)
+        .map_err(|e| e.to_string())?;
+    clipboard::copy_password(password.expose())
+}
+
+#[tauri::command]
+fn copy_username(state: Shared, id: String) -> Result<(), String> {
+    let username = guard(&state)?.username(&id).map_err(|e| e.to_string())?;
+    clipboard::copy_text(&username)
+}
+
+#[tauri::command]
+fn generate_password(state: Shared, options: PasswordOptionsInput) -> Result<Generated, String> {
+    guard(&state)?
+        .generate_password(&options)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn generate_passphrase(
+    state: Shared,
+    options: PassphraseOptionsInput,
+) -> Result<Generated, String> {
+    guard(&state)?
+        .generate_passphrase(&options)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command(async)]
+fn change_master_password(
+    state: Shared,
+    current: String,
+    new_password: String,
+) -> Result<(), String> {
+    let current = Zeroizing::new(current);
+    let new_password = Zeroizing::new(new_password);
+    guard(&state)?
+        .change_master_password(&current, &new_password)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn begin_recovery_rotation(state: Shared) -> Result<String, String> {
+    let code = guard(&state)?
+        .begin_recovery_rotation()
+        .map_err(|e| e.to_string())?;
+    Ok(code.to_string())
+}
+
+#[tauri::command(async)]
+fn finish_recovery_rotation(state: Shared, typed_code: String) -> Result<(), String> {
+    guard(&state)?
+        .finish_recovery_rotation(&typed_code)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn cancel_recovery_rotation(state: Shared) -> Result<(), String> {
+    guard(&state)?.cancel_recovery_rotation();
+    Ok(())
+}
+
+/// Runs for the life of the app: locks the vault after [`IDLE_LIMIT`] without
+/// activity or when Windows locks the session, and tells the window.
+fn spawn_auto_lock(app: tauri::AppHandle) {
+    thread::spawn(move || {
+        loop {
+            thread::sleep(AUTO_LOCK_POLL);
+            let session_locked = locker_device::is_session_locked();
+            let state = app.state::<Mutex<AppState>>();
+            let locked_now = match state.lock() {
+                Ok(mut state) => state.lock_if_needed(Instant::now(), IDLE_LIMIT, session_locked),
+                Err(_) => false,
+            };
+            if locked_now {
+                let _ = app.emit("vault-locked", ());
+            }
+        }
+    });
 }
 
 pub fn run() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![core_version])
+        .setup(|app| {
+            // `document_dir` follows the real Documents folder, including
+            // when Windows has redirected it (for example to OneDrive).
+            let vault_path = app
+                .path()
+                .document_dir()?
+                .join("Password Locker")
+                .join("vault.pwlk");
+            let device = DeviceKeyStore::default_location()?;
+            app.manage(Mutex::new(AppState::new(vault_path, device)));
+            spawn_auto_lock(app.handle().clone());
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            status,
+            begin_setup,
+            finish_setup,
+            cancel_setup,
+            unlock,
+            unlock_with_recovery,
+            lock,
+            keep_alive,
+            list_entries,
+            add_entry,
+            update_entry,
+            delete_entry,
+            reveal_password,
+            reveal_notes,
+            reveal_password_history,
+            copy_password,
+            copy_username,
+            generate_password,
+            generate_passphrase,
+            change_master_password,
+            begin_recovery_rotation,
+            finish_recovery_rotation,
+            cancel_recovery_rotation,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
