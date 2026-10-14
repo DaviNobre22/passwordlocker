@@ -1,0 +1,7 @@
+[package]
+name = "locker-core"
+description = "Vault format, crypto and entry logic for passwordlocker. No UI."
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
