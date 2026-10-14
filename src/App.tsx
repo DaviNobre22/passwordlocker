@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { api, errorText, onVaultLocked, type EntrySummary } from "./api";
 import { EntryForm } from "./components/EntryForm";
 import { Main } from "./components/Main";
+import { RestoreBackup } from "./components/RestoreBackup";
 import { RecoveryCode } from "./components/RecoveryCode";
 import { Settings } from "./components/Settings";
 import { Setup } from "./components/Setup";
@@ -18,6 +19,7 @@ type Screen =
   | { name: "main" }
   | { name: "form"; entry: EntrySummary | null }
   | { name: "settings" }
+  | { name: "restore"; replacing: boolean }
   | { name: "rotation-code"; code: string };
 
 /** At most one keep-alive call per this many milliseconds. */
@@ -27,7 +29,9 @@ function App() {
   const [screen, setScreen] = useState<Screen>({ name: "loading" });
   const [vaultPath, setVaultPath] = useState("");
 
-  const unlocked = ["main", "form", "settings", "rotation-code"].includes(screen.name);
+  const unlocked =
+    ["main", "form", "settings", "rotation-code"].includes(screen.name) ||
+    (screen.name === "restore" && screen.replacing);
 
   // Decide the first screen from what Rust says about the vault.
   useEffect(() => {
@@ -94,7 +98,21 @@ function App() {
       );
 
     case "setup":
-      return <Setup onCode={(code) => setScreen({ name: "setup-code", code })} />;
+      return (
+        <Setup
+          onCode={(code) => setScreen({ name: "setup-code", code })}
+          onRestore={() => setScreen({ name: "restore", replacing: false })}
+        />
+      );
+
+    case "restore":
+      return (
+        <RestoreBackup
+          replacing={screen.replacing}
+          onRestored={() => setScreen({ name: "main" })}
+          onCancel={() => setScreen(screen.replacing ? { name: "settings" } : { name: "setup" })}
+        />
+      );
 
     case "setup-code":
       return (
@@ -133,6 +151,7 @@ function App() {
         <Settings
           vaultPath={vaultPath}
           onRotation={(code) => setScreen({ name: "rotation-code", code })}
+          onRestore={() => setScreen({ name: "restore", replacing: true })}
           onBack={() => setScreen({ name: "main" })}
           onLock={lock}
         />
