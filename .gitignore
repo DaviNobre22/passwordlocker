@@ -7,24 +7,42 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 
+# Dependencies and build output
 node_modules
 dist
 dist-ssr
+/target
 *.local
+
+# Vault data and keys: never commit a real vault, its backups or a device key
+*.pwlk
+*.pwlk.bak.*
+*.pwlk.before-restore-*
+*.pwlk.tmp
+device.key
+
+# Environment files and secrets
+.env
+.env.*
+!.env.example
 
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
 .idea
-.DS_Store
 *.suo
 *.ntvs*
 *.njsproj
 *.sln
 *.sw?
 
-# Rust build output
-/target
+# Operating system files
+.DS_Store
+Thumbs.db
+desktop.ini
 
 # Claude Code worktrees and local settings
 /.claude/
+
+# Personal notes kept next to the code but out of the repo
+/linkedin-captions.md
