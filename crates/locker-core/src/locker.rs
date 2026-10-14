@@ -13,9 +13,15 @@ use crate::entry::{EntryDraft, EntryId, EntrySummary, PastPassword};
 use crate::error::{Error, Result};
 use crate::secret::SecretString;
 use crate::storage::{DEFAULT_BACKUPS, read_file, write_with_backups};
-use crate::strength::check_master_password;
+use crate::strength::{check_master_password, normalize_password};
 use crate::vault_file::{FactorKind, UnlockedVault};
 
+/// Master passwords are normalised to Unicode NFC before they become a key
+/// (see `normalize_password` in `strength.rs`), so "caf\u{e9}" and
+/// "cafe\u{301}" open the same vault. This changes which key a non-ASCII
+/// password derives, which was safe to do only because no real vaults
+/// existed yet.
+///
 /// An open vault. Dropping it wipes the keys and the decrypted entries,
 /// because every secret it owns zeroizes itself on drop.
 pub struct Locker {
@@ -47,6 +53,7 @@ impl Locker {
             return Err(Error::VaultExists);
         }
         check_master_password(password)?;
+        let password = normalize_password(password);
         let locker = Self {
             path: path.to_path_buf(),
             vault: UnlockedVault::create(password.as_bytes(), kdf, device, recovery)?,
@@ -60,6 +67,7 @@ impl Locker {
     /// factor (the device key or the recovery key).
     pub fn open(path: &Path, password: &str, kind: FactorKind, factor: &Key) -> Result<Self> {
         let file = read_file(path)?;
+        let password = normalize_password(password);
         let (vault, plaintext) = UnlockedVault::open(&file, password.as_bytes(), kind, factor)?;
         let contents = VaultContents::from_bytes(&plaintext)?;
         Ok(Self {
@@ -121,6 +129,8 @@ impl Locker {
     /// must pass the same strength rule as at creation.
     pub fn change_password(&mut self, current: &str, new: &str) -> Result<()> {
         check_master_password(new)?;
+        let current = normalize_password(current);
+        let new = normalize_password(new);
         self.vault
             .change_password(current.as_bytes(), new.as_bytes(), KdfParams::DEFAULT)?;
         self.save()
@@ -328,6 +338,17 @@ mod tests {
         locker.add(draft("Mail", "needle-password")).unwrap();
         let text = format!("{locker:?}");
         assert!(!text.contains("needle-password") && !text.contains("private note"));
+    }
+
+    #[test]
+    fn composed_and_decomposed_passwords_open_the_same_vault() {
+        let f = Fixture::new();
+        let composed = "caf\u{e9}-violet-anvil-quokka-drizzle-lantern";
+        let decomposed = "cafe\u{301}-violet-anvil-quokka-drizzle-lantern";
+        assert_ne!(composed, decomposed);
+        Locker::create_with_params(&f.path, composed, &f.device, &f.recovery, fast()).unwrap();
+        f.open(decomposed).unwrap();
+        f.open(composed).unwrap();
     }
 
     #[test]

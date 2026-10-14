@@ -4,9 +4,11 @@ import { api, errorText } from "../api";
 interface Props {
   /** Receives the recovery code to show; the vault is not created yet. */
   onCode: (code: string) => void;
+  /** Switches to restoring an existing backup instead of creating a vault. */
+  onRestore: () => void;
 }
 
-export function Setup({ onCode }: Props) {
+export function Setup({ onCode, onRestore }: Props) {
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
   const [error, setError] = useState("");
@@ -73,6 +75,11 @@ export function Setup({ onCode }: Props) {
           Continue
         </button>
       </form>
+      <p>
+        <button type="button" className="link" onClick={onRestore} disabled={busy}>
+          Restore from a backup file instead
+        </button>
+      </p>
     </main>
   );
 }
