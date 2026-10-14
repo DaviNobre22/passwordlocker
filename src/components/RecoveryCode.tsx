@@ -43,21 +43,41 @@ export function RecoveryCode({ title, code, onConfirm, onCancel }: Props) {
         </p>
       </div>
 
-      <section className="recovery-code" aria-label="Recovery code">
-        <p className="print-only">
-          Password Locker recovery code. Keep this paper somewhere safe, away from your
-          computer. Anyone with this code and your master password can open your vault.
-        </p>
-        <code>{code}</code>
-      </section>
+      {/* Hidden while typing it back, so the check proves it was written down
+          rather than copied from the screen. Unticking the box shows it again. */}
+      {!written && (
+        <section className="recovery-code" aria-label="Recovery code">
+          <p className="print-only">
+            Password Locker recovery code. Keep this paper somewhere safe, away from your
+            computer. Anyone with this code and your master password can open your vault.
+          </p>
+          <code>
+            {code.split("-").map((group, i) => (
+              <span key={i} className="code-group">
+                {i > 0 && "-"}
+                {group}
+              </span>
+            ))}
+          </code>
+        </section>
+      )}
 
       <form className="no-print" onSubmit={submit}>
-        <button type="button" onClick={() => window.print()}>
-          Print
-        </button>
+        {!written && (
+          <button type="button" onClick={() => window.print()}>
+            Print
+          </button>
+        )}
 
         <label className="check">
-          <input type="checkbox" checked={written} onChange={(e) => setWritten(e.target.checked)} />
+          <input
+            type="checkbox"
+            checked={written}
+            onChange={(e) => {
+              setWritten(e.target.checked);
+              setTyped("");
+            }}
+          />
           I have written it down
         </label>
 

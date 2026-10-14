@@ -209,8 +209,12 @@ button.link {
   font-size: 1.35rem;
   font-weight: 700;
   letter-spacing: 0.05em;
-  word-break: break-all;
-  user-select: all;
+}
+
+/* Lines may break between groups but never inside one. */
+.recovery-code .code-group {
+  display: inline-block;
+  white-space: nowrap;
 }
 
 .print-only {

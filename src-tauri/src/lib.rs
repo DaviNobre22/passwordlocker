@@ -229,17 +229,38 @@ fn spawn_auto_lock(app: tauri::AppHandle) {
     });
 }
 
+/// Development builds can keep the vault and device key in a throwaway
+/// folder named by `PASSWORDLOCKER_DEV_DIR`, so trying the app never touches
+/// the real ones. Release builds ignore the variable entirely.
+#[cfg(debug_assertions)]
+fn dev_data_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("PASSWORDLOCKER_DEV_DIR").map(std::path::PathBuf::from)
+}
+
+#[cfg(not(debug_assertions))]
+fn dev_data_dir() -> Option<std::path::PathBuf> {
+    None
+}
+
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
-            // `document_dir` follows the real Documents folder, including
-            // when Windows has redirected it (for example to OneDrive).
-            let vault_path = app
-                .path()
-                .document_dir()?
-                .join("Password Locker")
-                .join("vault.pwlk");
-            let device = DeviceKeyStore::default_location()?;
+            let (vault_path, device) = match dev_data_dir() {
+                Some(dir) => (
+                    dir.join("vault.pwlk"),
+                    DeviceKeyStore::at(dir.join("device.key")),
+                ),
+                None => (
+                    // `document_dir` follows the real Documents folder,
+                    // including when Windows has redirected it (for example
+                    // to OneDrive).
+                    app.path()
+                        .document_dir()?
+                        .join("Password Locker")
+                        .join("vault.pwlk"),
+                    DeviceKeyStore::default_location()?,
+                ),
+            };
             app.manage(Mutex::new(AppState::new(vault_path, device)));
             spawn_auto_lock(app.handle().clone());
             Ok(())
