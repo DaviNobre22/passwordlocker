@@ -34,6 +34,26 @@ pub enum Error {
 
     #[error(transparent)]
     Io(#[from] std::io::Error),
+
+    #[error("vault contents format version {0} is not supported by this version of the app")]
+    UnsupportedContentsVersion(u32),
+
+    #[error("no entry with that id")]
+    EntryNotFound,
+
+    #[error("invalid entry: {0}")]
+    InvalidEntry(&'static str),
+
+    #[error("invalid generator settings: {0}")]
+    InvalidGeneratorOptions(&'static str),
+
+    /// `feedback` is advice from the strength checker. It is built from
+    /// fixed texts and never contains any part of the password.
+    #[error("the master password is too weak: {feedback}")]
+    WeakPassword { feedback: String },
+
+    #[error("a vault file already exists at that location")]
+    VaultExists,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
