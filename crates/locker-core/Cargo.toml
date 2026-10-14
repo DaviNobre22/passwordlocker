@@ -8,8 +8,11 @@ edition.workspace = true
 argon2 = { version = "0.6", default-features = false, features = ["alloc", "zeroize"] }
 chacha20poly1305 = { version = "0.11", features = ["zeroize"] }
 getrandom = "0.4"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
 thiserror = "2"
 zeroize = "1.9"
+zxcvbn = { version = "3.1.1", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
