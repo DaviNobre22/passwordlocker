@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/locker-core", "src-tauri"]
+members = ["crates/locker-core", "crates/locker-device", "src-tauri"]
 resolver = "3"
 
 [workspace.package]

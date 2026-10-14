@@ -1933,6 +1933,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "locker-device"
+version = "0.1.0"
+dependencies = [
+ "locker-core",
+ "tempfile",
+ "thiserror 2.0.21",
+ "windows-sys 0.61.2",
+ "zeroize",
+]
+
+[[package]]
 name = "log"
 version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
