@@ -10,13 +10,13 @@
 //! contain secrets.
 
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use locker_core::{
     CharOptions, EntryDraft, EntryId, EntrySummary, FactorKind, Key, Locker, PassphraseOptions,
     SecretString, check_master_password, decode_recovery_code, encode_recovery_code,
-    generate_passphrase, generate_password,
+    generate_passphrase, generate_password, read_file, write_atomic,
 };
 use locker_device::DeviceKeyStore;
 use serde::{Deserialize, Serialize};
@@ -137,6 +137,9 @@ pub struct AppState {
     locker: Option<Locker>,
     pending_setup: Option<PendingSetup>,
     pending_rotation: Option<Key>,
+    /// The backup file the user picked, waiting for its password and code.
+    /// Only the path is kept; the window never names a file itself.
+    pending_restore: Option<PathBuf>,
     last_activity: Instant,
 }
 
@@ -148,6 +151,7 @@ impl AppState {
             locker: None,
             pending_setup: None,
             pending_rotation: None,
+            pending_restore: None,
             last_activity: Instant::now(),
         }
     }
@@ -457,6 +461,166 @@ impl AppState {
     pub fn cancel_recovery_rotation(&mut self) {
         self.pending_rotation = None;
     }
+
+    // --- backup and restore ----------------------------------------------
+
+    /// Fails unless the vault is unlocked. Used before a dialog is shown, so
+    /// the user is not asked for a file that would then be refused.
+    pub fn ensure_unlocked(&self) -> AppResult<()> {
+        self.locker().map(|_| ())
+    }
+
+    /// Writes a copy of the vault file to `dest`. The file is the encrypted
+    /// vault itself, so nothing readable leaves the app: opening the copy
+    /// still needs the master password and a second factor. Every change is
+    /// saved to disk straight away, so the file is always current.
+    pub fn export_backup_to(&mut self, dest: &Path) -> AppResult<()> {
+        self.touch();
+        self.ensure_unlocked()?;
+        if same_file(dest, &self.vault_path) {
+            return Err(AppError::new(
+                "choose a different place: that is the vault file itself",
+            ));
+        }
+        let bytes = read_file(&self.vault_path)?;
+        write_atomic(dest, &bytes)?;
+        Ok(())
+    }
+
+    /// Remembers the backup file the user picked. Nothing is checked beyond
+    /// the file existing: its contents are verified, with the password and
+    /// recovery code, in [`AppState::restore_backup`].
+    pub fn set_restore_source(&mut self, source: PathBuf) -> AppResult<()> {
+        self.touch();
+        if !source.is_file() {
+            return Err(AppError::new("that file could not be found"));
+        }
+        if same_file(&source, &self.vault_path) {
+            return Err(AppError::new(
+                "that is the current vault file, not a backup",
+            ));
+        }
+        self.pending_restore = Some(source);
+        Ok(())
+    }
+
+    pub fn cancel_restore(&mut self) {
+        self.pending_restore = None;
+    }
+
+    /// Replaces the vault with the picked backup.
+    ///
+    /// `password` and `code` must be the ones that belong to the backup,
+    /// which may differ from the current vault's. The order is chosen so
+    /// that a failure at any point leaves the current vault usable:
+    ///
+    /// 1. the backup is opened where it is (recovery slot); a wrong
+    ///    password, wrong code or a file that is not a vault stops here with
+    ///    nothing touched;
+    /// 2. an existing vault is copied to `<vault>.before-restore-<seconds>`;
+    /// 3. the backup replaces the vault file atomically;
+    /// 4. the vault is opened again at its own path and this PC's device key
+    ///    is registered. If that fails, the old file is put back.
+    ///
+    /// An existing vault must be unlocked: only someone who could already
+    /// read it may overwrite it. The rolling `.bak.N` files are left as
+    /// they are, so they still hold the replaced vault's recent versions.
+    pub fn restore_backup(&mut self, password: &str, code: &str) -> AppResult<()> {
+        self.touch();
+        let source = self
+            .pending_restore
+            .clone()
+            .ok_or_else(|| AppError::new("no backup file has been chosen"))?;
+        let existing = self.vault_path.exists();
+        if existing && self.locker.is_none() {
+            return Err(AppError::locked());
+        }
+
+        let recovery = decode_recovery_code(code)?;
+        Locker::open(&source, password, FactorKind::Recovery, &recovery)?;
+
+        let previous_bytes = if existing {
+            let bytes = read_file(&self.vault_path)?;
+            write_atomic(&unused_restore_copy_path(&self.vault_path), &bytes)?;
+            Some(bytes)
+        } else {
+            None
+        };
+        if let Some(dir) = self.vault_path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        write_atomic(&self.vault_path, &read_file(&source)?)?;
+
+        // The open vault is set aside, not dropped, so it can be put back.
+        let previous_locker = self.locker.take();
+        match self.unlock_with_recovery(password, code) {
+            Ok(()) => {
+                self.pending_restore = None;
+                self.pending_setup = None;
+                Ok(())
+            }
+            Err(err) => {
+                // Best effort: the safety copy still exists if this fails.
+                let _ = match &previous_bytes {
+                    Some(bytes) => write_atomic(&self.vault_path, bytes).map_err(|_| ()),
+                    None => std::fs::remove_file(&self.vault_path).map_err(|_| ()),
+                };
+                self.locker = previous_locker;
+                Err(err)
+            }
+        }
+    }
+}
+
+/// Whether both paths name the same existing file. A path that does not
+/// exist (yet) is never the same as another.
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// `<vault>.before-restore-<unix seconds>`, with `-2`, `-3`... added if that
+/// name is taken, so an earlier safety copy is never overwritten.
+fn unused_restore_copy_path(vault: &Path) -> PathBuf {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let name = vault
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "vault.pwlk".to_owned());
+    let mut candidate = vault.with_file_name(format!("{name}.before-restore-{seconds}"));
+    let mut attempt = 2;
+    while candidate.exists() {
+        candidate = vault.with_file_name(format!("{name}.before-restore-{seconds}-{attempt}"));
+        attempt += 1;
+    }
+    candidate
+}
+
+/// The suggested name for an exported backup, e.g.
+/// `passwordlocker-backup-2026-10-14.pwlk`. The date is UTC, because the
+/// standard library has no time zone support.
+pub fn backup_file_name(unix_seconds: u64) -> String {
+    // Days since 1970-01-01 to a calendar date (Howard Hinnant's
+    // "civil from days" algorithm), so no date crate is needed.
+    let days = (unix_seconds / 86_400) as i64 + 719_468;
+    let era = days.div_euclid(146_097);
+    let day_of_era = days.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    format!("passwordlocker-backup-{year:04}-{month:02}-{day:02}.pwlk")
 }
 
 /// Checks the code the user typed back against the key that was shown.
@@ -762,6 +926,163 @@ mod tests {
                     separator: None
                 })
                 .is_err()
+        );
+    }
+
+    /// A finished vault with one entry ("Bank") on its own "PC", exported to
+    /// a file. Returns the folder holding it, the file and the recovery code.
+    fn make_backup() -> (tempfile::TempDir, PathBuf, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut origin = AppState::new(
+            dir.path().join("origin").join("vault.pwlk"),
+            DeviceKeyStore::at(dir.path().join("origin-pc").join("device.key")),
+        );
+        let code = origin.begin_setup(NEW_PASSWORD).unwrap().to_string();
+        origin.finish_setup(&code).unwrap();
+        origin
+            .add_entry(input("Bank", Some("bank-pw"), None))
+            .unwrap();
+        let file = dir.path().join("backup.pwlk");
+        origin.export_backup_to(&file).unwrap();
+        (dir, file, code)
+    }
+
+    #[test]
+    fn export_writes_the_vault_file_and_needs_an_unlocked_vault() {
+        let mut f = Fixture::new();
+        let vault = Fixture::vault_path(f.dir.path());
+        let dest = f.dir.path().join("out.pwlk");
+        f.state.export_backup_to(&dest).unwrap();
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            std::fs::read(&vault).unwrap()
+        );
+
+        // The copy opens with the password and the recovery code.
+        let recovery = decode_recovery_code(&f.code).unwrap();
+        Locker::open(&dest, PASSWORD, FactorKind::Recovery, &recovery).unwrap();
+
+        assert!(f.state.export_backup_to(&vault).is_err());
+        f.state.lock();
+        assert!(f.state.export_backup_to(&dest).is_err());
+    }
+
+    #[test]
+    fn restore_into_an_empty_location_registers_this_pc() {
+        let (_keep, file, code) = make_backup();
+        let dir = tempfile::tempdir().unwrap();
+        let path = Fixture::vault_path(dir.path());
+        let device_path = dir.path().join("pc").join("device.key");
+        let mut state = AppState::new(path, DeviceKeyStore::at(&device_path));
+
+        // Nothing has been picked yet.
+        assert!(state.restore_backup(NEW_PASSWORD, &code).is_err());
+        state.set_restore_source(file).unwrap();
+        state.restore_backup(NEW_PASSWORD, &code).unwrap();
+
+        assert!(state.status().unlocked);
+        assert_eq!(state.list_entries("").unwrap()[0].title, "Bank");
+        // The device key was created and registered: a plain unlock works.
+        assert!(device_path.exists());
+        state.lock();
+        state.unlock(NEW_PASSWORD).unwrap();
+        // The pick is consumed.
+        assert!(state.restore_backup(NEW_PASSWORD, &code).is_err());
+    }
+
+    #[test]
+    fn a_wrong_password_or_code_leaves_everything_untouched() {
+        let (_keep, file, code) = make_backup();
+        let mut f = Fixture::new();
+        let vault = Fixture::vault_path(f.dir.path());
+        let before = std::fs::read(&vault).unwrap();
+        f.state.set_restore_source(file).unwrap();
+
+        // The current vault's own password and code are the wrong ones here.
+        assert!(f.state.restore_backup(PASSWORD, &code).is_err());
+        assert!(f.state.restore_backup(NEW_PASSWORD, &f.code).is_err());
+        assert!(f.state.restore_backup(NEW_PASSWORD, "garbage").is_err());
+
+        assert_eq!(std::fs::read(&vault).unwrap(), before);
+        assert!(f.state.status().unlocked);
+        assert!(f.state.list_entries("").unwrap().is_empty());
+        assert!(restore_copies(&vault).is_empty());
+    }
+
+    fn restore_copies(vault: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(vault.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.to_string_lossy().contains(".before-restore-"))
+            .collect()
+    }
+
+    #[test]
+    fn restore_over_an_existing_vault_keeps_a_safety_copy() {
+        let (_keep, file, code) = make_backup();
+        let mut f = Fixture::new();
+        let vault = Fixture::vault_path(f.dir.path());
+        f.state.add_entry(input("Mail", Some("pw"), None)).unwrap();
+        let before = std::fs::read(&vault).unwrap();
+
+        // A locked vault may not be replaced.
+        f.state.set_restore_source(file.clone()).unwrap();
+        f.state.lock();
+        assert!(f.state.restore_backup(NEW_PASSWORD, &code).is_err());
+        assert!(restore_copies(&vault).is_empty());
+        f.state.unlock(PASSWORD).unwrap();
+
+        f.state.set_restore_source(file).unwrap();
+        f.state.restore_backup(NEW_PASSWORD, &code).unwrap();
+
+        let entries = f.state.list_entries("").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].title, "Bank");
+        let copies = restore_copies(&vault);
+        assert_eq!(copies.len(), 1);
+        assert_eq!(std::fs::read(&copies[0]).unwrap(), before);
+        // The copy is the old vault: it opens with the old password.
+        let device = f.state.device.load().unwrap().unwrap();
+        let old = Locker::open(&copies[0], PASSWORD, FactorKind::Device, &device).unwrap();
+        assert_eq!(old.summaries()[0].title, "Mail");
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_vault_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let junk = dir.path().join("notes.pwlk");
+        std::fs::write(&junk, b"this is not a vault at all, just text").unwrap();
+        let mut state = AppState::new(
+            Fixture::vault_path(dir.path()),
+            DeviceKeyStore::at(dir.path().join("device.key")),
+        );
+        state.set_restore_source(junk).unwrap();
+        let code = encode_recovery_code(&Key::generate().unwrap());
+        let err = state.restore_backup(PASSWORD, &code).unwrap_err();
+        assert_eq!(err.to_string(), locker_core::Error::NotAVault.to_string());
+        assert!(!Fixture::vault_path(dir.path()).exists());
+        assert!(
+            state
+                .set_restore_source(dir.path().join("missing"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn backup_names_use_the_utc_date() {
+        assert_eq!(backup_file_name(0), "passwordlocker-backup-1970-01-01.pwlk");
+        assert_eq!(
+            backup_file_name(1_700_000_000),
+            "passwordlocker-backup-2023-11-14.pwlk"
+        );
+        // A leap day, and the last second of a year.
+        assert_eq!(
+            backup_file_name(1_709_164_800),
+            "passwordlocker-backup-2024-02-29.pwlk"
+        );
+        assert_eq!(
+            backup_file_name(1_767_225_599),
+            "passwordlocker-backup-2025-12-31.pwlk"
         );
     }
 }

@@ -5,11 +5,13 @@ interface Props {
   vaultPath: string;
   /** Receives the new recovery code to show on the verify screen. */
   onRotation: (code: string) => void;
+  /** Opens the restore screen, which replaces the vault with a backup. */
+  onRestore: () => void;
   onBack: () => void;
   onLock: () => void;
 }
 
-export function Settings({ vaultPath, onRotation, onBack, onLock }: Props) {
+export function Settings({ vaultPath, onRotation, onRestore, onBack, onLock }: Props) {
   const [current, setCurrent] = useState("");
   const [next, setNext] = useState("");
   const [confirm, setConfirm] = useState("");
@@ -46,6 +48,20 @@ export function Settings({ vaultPath, onRotation, onBack, onLock }: Props) {
       onRotation(await api.beginRecoveryRotation());
     } catch (e) {
       setError(errorText(e));
+    }
+  }
+
+  async function exportBackup() {
+    setMessage("");
+    setError("");
+    setBusy(true);
+    try {
+      const saved = await api.exportBackup();
+      if (saved !== null) setMessage(`Backup saved to ${saved}`);
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -99,6 +115,24 @@ export function Settings({ vaultPath, onRotation, onBack, onLock }: Props) {
         <p>Make a new recovery code. The old one stops working.</p>
         <button type="button" onClick={newRecoveryCode}>
           New recovery code
+        </button>
+      </section>
+
+      <section>
+        <h2>Backup</h2>
+        <p>
+          Save a copy of your vault to a file, for example on a USB stick. The copy is encrypted:
+          on another PC it opens with your master password and your recovery code.
+        </p>
+        <button type="button" onClick={exportBackup} disabled={busy}>
+          Export backup...
+        </button>
+        <p>
+          Restoring replaces the vault on this PC with a backup file. You will need the master
+          password and recovery code of that backup.
+        </p>
+        <button type="button" onClick={onRestore} disabled={busy}>
+          Restore from a backup file...
         </button>
       </section>
 
