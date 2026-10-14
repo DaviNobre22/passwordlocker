@@ -54,6 +54,11 @@ pub enum Error {
 
     #[error("a vault file already exists at that location")]
     VaultExists,
+
+    /// Deliberately says nothing about what was wrong with the text (length,
+    /// checksum, character) and never includes it.
+    #[error("the recovery code is not valid: check it for typing mistakes")]
+    InvalidRecoveryCode,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -1,0 +1,17 @@
+[package]
+name = "locker-device"
+description = "Device key storage for passwordlocker, protected by Windows DPAPI."
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+locker-core = { path = "../locker-core" }
+thiserror = "2"
+zeroize = "1.9"
+
+# Only Windows has DPAPI; elsewhere the crate compiles to a stub.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+
+[dev-dependencies]
+tempfile = "3"
